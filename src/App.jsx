@@ -1180,26 +1180,48 @@ function DashboardPage({ user, setPage, setUser, RATES }) {
 
 function WalletPage({ user, setUser, RATES }) {
   const [wallet, setWallet] = useState(null);
+  const [walletChartData, setWalletChartData] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!user?.id) return;
-    const loadWallet = async () => {
-      const { data } = await supabase.from("wallets").select("*").eq("user_id", user.id).single();
-      if (data) {
-        setWallet(data);
-        setUser(prev => ({ ...prev, balance: data.balance, currency: data.currency }));
+    const loadAll = async () => {
+      const [{ data: walletData }, { data: txData }] = await Promise.all([
+        supabase.from("wallets").select("*").eq("user_id", user.id).single(),
+        supabase.from("transactions")
+          .select("created_at, sender_id, receiver_id, sent_amount, received_amount")
+          .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
+          .order("created_at", { ascending: true }),
+      ]);
+      if (walletData) {
+        setWallet(walletData);
+        setUser(prev => ({ ...prev, balance: walletData.balance, currency: walletData.currency }));
       }
+      // Build the running-balance chart from real transactions. Money in
+      // (received OR deposit where sender_id is null) increases the running
+      // total; money out (sent OR withdrawal) decreases it.
+      let running = 0;
+      const points = (txData || []).map(tx => {
+        const isOutflow = tx.sender_id === user.id;
+        running += isOutflow ? -Number(tx.sent_amount || 0) : Number(tx.received_amount || 0);
+        return {
+          d: new Date(tx.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
+          v: parseFloat(running.toFixed(4)),
+        };
+      });
+      if (walletData) points.push({ d: "Now", v: parseFloat(Number(walletData.balance).toFixed(4)) });
+      setWalletChartData(points.length < 2 ? [{ d: "Start", v: 0 }, { d: "Now", v: walletData?.balance || 0 }] : points);
       setLoading(false);
     };
-    loadWallet();
-    const channel = supabase.channel("live-wallet")
-      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "wallets", filter: `user_id=eq.${user.id}` }, (payload) => {
-        setWallet(payload.new);
-        setUser(prev => ({ ...prev, balance: payload.new.balance, currency: payload.new.currency }));
-      })
+    loadAll();
+    const walletCh = supabase.channel("live-wallet")
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "wallets", filter: `user_id=eq.${user.id}` }, () => loadAll())
       .subscribe();
-    return () => supabase.removeChannel(channel);
+    const txCh = supabase.channel("live-wallet-tx")
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions", filter: `sender_id=eq.${user.id}` }, () => loadAll())
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions", filter: `receiver_id=eq.${user.id}` }, () => loadAll())
+      .subscribe();
+    return () => { supabase.removeChannel(walletCh); supabase.removeChannel(txCh); };
     // setUser from useState is stable, intentionally excluded from deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
@@ -1207,15 +1229,6 @@ function WalletPage({ user, setUser, RATES }) {
   const balance = wallet?.balance || 0;
   const currency = wallet?.currency || user?.currency || "BWP";
   const usdValue = RATES[currency] ? (balance / RATES[currency]).toFixed(2) : "0.00";
-
-  const walletChartData = [
-    { d: "Jan", v: balance * 0.6 }, { d: "Feb", v: balance * 0.65 },
-    { d: "Mar", v: balance * 0.7 }, { d: "Apr", v: balance * 0.68 },
-    { d: "May", v: balance * 0.75 }, { d: "Jun", v: balance * 0.8 },
-    { d: "Jul", v: balance * 0.78 }, { d: "Aug", v: balance * 0.85 },
-    { d: "Sep", v: balance * 0.9 }, { d: "Oct", v: balance * 0.88 },
-    { d: "Nov", v: balance * 0.95 }, { d: "Dec", v: balance },
-  ];
 
   return (
     <div style={{ flex: 1, padding: "32px 36px", overflowY: "auto" }}>
@@ -1570,8 +1583,8 @@ function NotificationsPage({ user }) {
     setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n));
   };
 
-  const typeIcons = { transfer: "💸", system: "⚙️", security: "🔒" };
-  const typeColors = { transfer: COLORS.success, system: COLORS.blue, security: COLORS.warning };
+  const typeIcons = { transfer: "💸", deposit: "↓", withdrawal: "↑", system: "⚙️", security: "🔒" };
+  const typeColors = { transfer: COLORS.success, deposit: COLORS.success, withdrawal: COLORS.danger, system: COLORS.blue, security: COLORS.warning };
 
   return (
     <div style={{ flex: 1, padding: "32px 36px", overflowY: "auto" }}>
@@ -1717,7 +1730,7 @@ function DepositPage({ user, setUser, showToast, setPage }) {
       // accept a deposit row (e.g. NOT NULL on sender_id), we still keep the
       // balance update so the demo flow works.
       const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
-      await supabase.from("transactions").insert({
+      const { error: txErr } = await supabase.from("transactions").insert({
         sender_id: null,
         receiver_id: user.id,
         sent_amount: amt,
@@ -1728,13 +1741,19 @@ function DepositPage({ user, setUser, showToast, setPage }) {
         type: "deposit",
         note: `Deposit via ${methodLabel}`,
       });
-      await supabase.from("notifications").insert({
+      if (txErr) console.warn("Deposit transaction insert failed:", txErr.message);
+      // Try with the new type first, fall back to "system" if the schema rejects it.
+      const notif = {
         user_id: user.id,
-        type: "deposit",
         title: "Deposit successful",
         message: `${formatAmount(amt, currency)} added via ${methodLabel}.`,
         is_read: false,
-      });
+      };
+      const { error: nErr } = await supabase.from("notifications").insert({ ...notif, type: "deposit" });
+      if (nErr) {
+        console.warn("Notification insert with type=deposit failed, retrying as system:", nErr.message);
+        await supabase.from("notifications").insert({ ...notif, type: "system" });
+      }
 
       setUser(prev => ({ ...prev, balance: newBalance }));
       setDepositedAmount(amt);
@@ -1795,14 +1814,14 @@ function DepositPage({ user, setUser, showToast, setPage }) {
               <div style={{ display: "flex", gap: 8 }}>
                 <div style={{ ...S.input, width: 70, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.textSub, fontWeight: 600, padding: "12px 0" }}>+267</div>
                 <input style={{ ...S.input, flex: 1, borderColor: mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) ? COLORS.danger : COLORS.cardBorder }}
-                  type="tel" inputMode="numeric" placeholder="71 234 567" value={mobile.number}
+                  type="tel" inputMode="numeric" placeholder="7X XXX XXX" value={mobile.number}
                   onChange={e => setMobile(m => ({ ...m, number: formatBwNumber(e.target.value) }))} />
               </div>
               <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>
-                Botswana mobile number — 8 digits starting with 7.
+                Botswana mobile number — 8 digits, any 7X prefix (71, 72, 73, 74, 75, 76, 77).
               </div>
               {mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) && (
-                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Enter a valid Botswana mobile number (e.g. 71 234 567).</div>
+                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Enter a valid Botswana mobile number (e.g. 74 568 942).</div>
               )}
             </div>
             <div style={{ marginBottom: 20 }}>
@@ -2033,7 +2052,7 @@ function WithdrawPage({ user, setUser, showToast, setPage }) {
 
       const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
       // Record the withdrawal so it appears in History. sender_id = user, receiver_id = null.
-      await supabase.from("transactions").insert({
+      const txRow = {
         sender_id: user.id,
         receiver_id: null,
         sent_amount: amt,
@@ -2041,16 +2060,24 @@ function WithdrawPage({ user, setUser, showToast, setPage }) {
         sent_currency: currency,
         received_currency: currency,
         status: "completed",
-        type: "withdrawal",
         note: `Withdrawal via ${methodLabel}`,
-      });
-      await supabase.from("notifications").insert({
+      };
+      const { error: txErr } = await supabase.from("transactions").insert({ ...txRow, type: "withdrawal" });
+      if (txErr) {
+        console.warn("Transaction insert with type=withdrawal failed, retrying as 'sent':", txErr.message);
+        await supabase.from("transactions").insert({ ...txRow, type: "sent" });
+      }
+      const notif = {
         user_id: user.id,
-        type: "withdrawal",
         title: "Withdrawal successful",
         message: `${formatAmount(amt, currency)} sent to ${methodLabel}.`,
         is_read: false,
-      });
+      };
+      const { error: nErr } = await supabase.from("notifications").insert({ ...notif, type: "withdrawal" });
+      if (nErr) {
+        console.warn("Notification insert with type=withdrawal failed, retrying as system:", nErr.message);
+        await supabase.from("notifications").insert({ ...notif, type: "system" });
+      }
 
       setUser(prev => ({ ...prev, balance: newBalance }));
       setWithdrawnAmount(amt);
@@ -2088,12 +2115,12 @@ function WithdrawPage({ user, setUser, showToast, setPage }) {
               {METHODS.map(m => (
                 <button key={m.id} onClick={() => selectMethod(m.id)}
                   style={{ display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", borderRadius: 12, border: `1px solid ${COLORS.cardBorder}`, background: COLORS.inputBg, color: COLORS.text, cursor: "pointer", textAlign: "left", transition: "all 0.15s" }}>
-                  <div style={{ width: 40, height: 40, borderRadius: 10, background: COLORS.danger + "22", color: COLORS.danger, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>{m.icon}</div>
+                  <div style={{ width: 40, height: 40, borderRadius: 10, background: COLORS.accent + "22", color: COLORS.accent, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>{m.icon}</div>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.danger }}>{m.label}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.accent }}>{m.label}</div>
                     <div style={{ fontSize: 12, color: COLORS.textSub, marginTop: 2 }}>{m.sub}</div>
                   </div>
-                  <div style={{ color: COLORS.danger, fontSize: 18 }}>›</div>
+                  <div style={{ color: COLORS.accent, fontSize: 18 }}>›</div>
                 </button>
               ))}
             </div>
@@ -2111,14 +2138,14 @@ function WithdrawPage({ user, setUser, showToast, setPage }) {
               <div style={{ display: "flex", gap: 8 }}>
                 <div style={{ ...S.input, width: 70, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.textSub, fontWeight: 600, padding: "12px 0" }}>+267</div>
                 <input style={{ ...S.input, flex: 1, borderColor: mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) ? COLORS.danger : COLORS.cardBorder }}
-                  type="tel" inputMode="numeric" placeholder="71 234 567" value={mobile.number}
+                  type="tel" inputMode="numeric" placeholder="7X XXX XXX" value={mobile.number}
                   onChange={e => setMobile(m => ({ ...m, number: formatBwNumber(e.target.value) }))} />
               </div>
               <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>
-                Botswana mobile number — 8 digits starting with 7.
+                Botswana mobile number — 8 digits, any 7X prefix (71, 72, 73, 74, 75, 76, 77).
               </div>
               {mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) && (
-                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Enter a valid Botswana mobile number (e.g. 71 234 567).</div>
+                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Enter a valid Botswana mobile number (e.g. 74 568 942).</div>
               )}
             </div>
             <div style={{ marginBottom: 20 }}>
@@ -2646,7 +2673,8 @@ export default function App() {
     const channel = supabase.channel("global-notifications")
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications", filter: `user_id=eq.${user.id}` }, (payload) => {
         setUnreadCount(prev => prev + 1);
-        showToast(payload.new.type === "transfer" ? "success" : "info", payload.new.title, payload.new.message);
+        const successTypes = new Set(["transfer", "deposit", "withdrawal"]);
+        showToast(successTypes.has(payload.new.type) ? "success" : "info", payload.new.title, payload.new.message);
       })
       .subscribe();
     return () => supabase.removeChannel(channel);
