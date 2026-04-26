@@ -184,6 +184,7 @@ const NAV_ITEMS = [
   { id: "wallet", label: "Wallet", icon: "◈" },
   { id: "send", label: "Send", icon: "↗" },
   { id: "deposit", label: "Deposit", icon: "↓" },
+  { id: "withdraw", label: "Withdraw", icon: "↑" },
   { id: "history", label: "History", icon: "≡" },
   { id: "notifications", label: "Messages", icon: "◎" },
   { id: "settings", label: "Account", icon: "⊙" },
@@ -1143,8 +1144,8 @@ function DashboardPage({ user, setPage, setUser, RATES }) {
                 {[
                   { label: "Send Money", icon: "↗", action: "send", color: COLORS.accent },
                   { label: "Deposit", icon: "↓", action: "deposit", color: COLORS.success },
+                  { label: "Withdraw", icon: "↑", action: "withdraw", color: COLORS.danger },
                   { label: "View History", icon: "≡", action: "history", color: COLORS.blue },
-                  { label: "Messages", icon: "◎", action: "notifications", color: COLORS.warning },
                 ].map(a => (
                   <button key={a.action} onClick={() => setPage(a.action)} style={{ padding: "16px 12px", borderRadius: 12, border: `1px solid ${COLORS.cardBorder}`, background: a.color + "10", cursor: "pointer", textAlign: "center", transition: "all 0.15s" }}>
                     <div style={{ fontSize: 22, color: a.color, marginBottom: 6 }}>{a.icon}</div>
@@ -1925,6 +1926,331 @@ function DepositPage({ user, setUser, showToast, setPage }) {
   );
 }
 
+// ─── WITHDRAW PAGE ────────────────────────────────────────────────────────────
+//
+// Mirror of DepositPage but money flows OUT: balance is decremented, the
+// transactions row is recorded with sender_id = user, receiver_id = null,
+// type = "withdrawal".
+
+function WithdrawPage({ user, setUser, showToast, setPage }) {
+  // Steps: "method" → ("mobile"|"card") → "amount" → "success"
+  const [step, setStep] = useState("method");
+  const [method, setMethod] = useState(null); // "myzaka" | "orange" | "card"
+  const [mobile, setMobile] = useState({ number: "", pin: "" });
+  const [card, setCard] = useState({ number: "", expiry: "", cvv: "", name: "" });
+  const [amount, setAmount] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [withdrawnAmount, setWithdrawnAmount] = useState(0);
+
+  const currency = user?.currency || "BWP";
+  const balance = Number(user?.balance) || 0;
+
+  const METHODS = [
+    { id: "myzaka", label: "MyZaka",       sub: "Cash out to Mascom mobile money",  icon: "📱" },
+    { id: "orange", label: "Orange Money", sub: "Cash out to Orange mobile money",  icon: "🟠" },
+    { id: "card",   label: "Card / Bank",  sub: "Payout to Visa / Mastercard",      icon: "💳" },
+  ];
+
+  const selectMethod = (id) => {
+    setMethod(id);
+    setStep(id === "card" ? "card" : "mobile");
+  };
+
+  // Reuse the same Botswana mobile validation as deposit.
+  const normalizeBwNumber = (raw) => {
+    let d = (raw || "").replace(/\D/g, "");
+    if (d.startsWith("267")) d = d.slice(3);
+    return d;
+  };
+  const mobileValid = () => {
+    const digits = normalizeBwNumber(mobile.number);
+    return /^7\d{7}$/.test(digits) && /^\d{4,5}$/.test(mobile.pin);
+  };
+
+  const luhnOk = (num) => {
+    if (!/^\d+$/.test(num)) return false;
+    let sum = 0, alt = false;
+    for (let i = num.length - 1; i >= 0; i--) {
+      let n = parseInt(num[i], 10);
+      if (alt) { n *= 2; if (n > 9) n -= 9; }
+      sum += n; alt = !alt;
+    }
+    return sum % 10 === 0;
+  };
+
+  const expiryOk = (exp) => {
+    const m = /^(\d{2})\/(\d{2})$/.exec(exp);
+    if (!m) return false;
+    const month = parseInt(m[1], 10);
+    const year = 2000 + parseInt(m[2], 10);
+    if (month < 1 || month > 12) return false;
+    const now = new Date();
+    const endOfExpiry = new Date(year, month, 0, 23, 59, 59);
+    if (endOfExpiry < now) return false;
+    if (year > now.getFullYear() + 20) return false;
+    return true;
+  };
+
+  const cardValid = () => {
+    const num = card.number.replace(/\s/g, "");
+    return /^\d{13,19}$/.test(num) && luhnOk(num) && expiryOk(card.expiry) && /^\d{3,4}$/.test(card.cvv) && card.name.trim().length >= 2;
+  };
+
+  const formatCardNumber = (v) => v.replace(/\D/g, "").slice(0, 19).replace(/(.{4})/g, "$1 ").trim();
+  const formatExpiry = (v) => {
+    const d = v.replace(/\D/g, "").slice(0, 4);
+    return d.length >= 3 ? `${d.slice(0, 2)}/${d.slice(2)}` : d;
+  };
+  const formatBwNumber = (v) => {
+    let d = (v || "").replace(/\D/g, "");
+    if (d.startsWith("267")) d = d.slice(3);
+    d = d.slice(0, 8);
+    if (d.length <= 2) return d;
+    if (d.length <= 5) return `${d.slice(0, 2)} ${d.slice(2)}`;
+    return `${d.slice(0, 2)} ${d.slice(2, 5)} ${d.slice(5)}`;
+  };
+
+  const parsedAmount = parseFloat(amount) || 0;
+  const insufficient = parsedAmount > balance;
+
+  const submitWithdraw = async () => {
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) { showToast("error", "Invalid amount", "Enter an amount greater than zero."); return; }
+    if (amt > balance) { showToast("error", "Insufficient balance", "You don't have enough in your wallet."); return; }
+
+    setLoading(true);
+    try {
+      // Simulate processing latency — mobile money/card payout
+      await new Promise(r => setTimeout(r, 1500));
+
+      const newBalance = Number(balance) - amt;
+
+      const { error: walletErr } = await supabase
+        .from("wallets")
+        .update({ balance: newBalance })
+        .eq("user_id", user.id);
+      if (walletErr) throw new Error(walletErr.message);
+
+      const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
+      // Record the withdrawal so it appears in History. sender_id = user, receiver_id = null.
+      await supabase.from("transactions").insert({
+        sender_id: user.id,
+        receiver_id: null,
+        sent_amount: amt,
+        received_amount: amt,
+        sent_currency: currency,
+        received_currency: currency,
+        status: "completed",
+        type: "withdrawal",
+        note: `Withdrawal via ${methodLabel}`,
+      });
+      await supabase.from("notifications").insert({
+        user_id: user.id,
+        type: "withdrawal",
+        title: "Withdrawal successful",
+        message: `${formatAmount(amt, currency)} sent to ${methodLabel}.`,
+        is_read: false,
+      });
+
+      setUser(prev => ({ ...prev, balance: newBalance }));
+      setWithdrawnAmount(amt);
+      setStep("success");
+      showToast("success", "Withdrawal successful", `${formatAmount(amt, currency)} sent to ${methodLabel}.`);
+    } catch (err) {
+      showToast("error", "Withdrawal failed", err.message || "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reset = () => {
+    setStep("method"); setMethod(null);
+    setMobile({ number: "", pin: "" });
+    setCard({ number: "", expiry: "", cvv: "", name: "" });
+    setAmount(""); setWithdrawnAmount(0);
+  };
+
+  const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
+
+  return (
+    <div style={{ flex: 1, padding: "32px 36px", overflowY: "auto" }}>
+      <h1 style={{ fontSize: 24, fontWeight: 800, margin: "0 0 6px", fontFamily: "'Syne', sans-serif" }}>Withdraw</h1>
+      <p style={{ fontSize: 13, color: COLORS.textMuted, marginBottom: 24 }}>
+        Move money out of your Ozeb wallet · Balance: <span style={{ color: COLORS.accent, fontWeight: 700 }}>{formatAmount(balance, currency)}</span>
+      </p>
+
+      <div style={{ maxWidth: 520 }}>
+        {/* Step: method */}
+        {step === "method" && (
+          <div style={S.card}>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 14 }}>Choose a withdrawal method</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {METHODS.map(m => (
+                <button key={m.id} onClick={() => selectMethod(m.id)}
+                  style={{ display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", borderRadius: 12, border: `1px solid ${COLORS.cardBorder}`, background: COLORS.inputBg, color: COLORS.text, cursor: "pointer", textAlign: "left", transition: "all 0.15s" }}>
+                  <div style={{ width: 40, height: 40, borderRadius: 10, background: COLORS.danger + "22", color: COLORS.danger, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>{m.icon}</div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.danger }}>{m.label}</div>
+                    <div style={{ fontSize: 12, color: COLORS.textSub, marginTop: 2 }}>{m.sub}</div>
+                  </div>
+                  <div style={{ color: COLORS.danger, fontSize: 18 }}>›</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Step: mobile money details */}
+        {step === "mobile" && (
+          <div style={S.card}>
+            <button onClick={() => setStep("method")} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", fontSize: 13, marginBottom: 14, padding: 0 }}>← Back</button>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>{methodLabel} details</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, marginBottom: 18 }}>Enter the phone number and PIN of the {methodLabel} account that should receive the cash-out.</div>
+            <div style={{ marginBottom: 14 }}>
+              <label style={S.label}>Phone Number</label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <div style={{ ...S.input, width: 70, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.textSub, fontWeight: 600, padding: "12px 0" }}>+267</div>
+                <input style={{ ...S.input, flex: 1, borderColor: mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) ? COLORS.danger : COLORS.cardBorder }}
+                  type="tel" inputMode="numeric" placeholder="71 234 567" value={mobile.number}
+                  onChange={e => setMobile(m => ({ ...m, number: formatBwNumber(e.target.value) }))} />
+              </div>
+              <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>
+                Botswana mobile number — 8 digits starting with 7.
+              </div>
+              {mobile.number && !/^7\d{7}$/.test(normalizeBwNumber(mobile.number)) && (
+                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Enter a valid Botswana mobile number (e.g. 71 234 567).</div>
+              )}
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={S.label}>PIN</label>
+              <input style={S.input} type="password" inputMode="numeric" maxLength={5} placeholder="••••" value={mobile.pin}
+                onChange={e => setMobile(m => ({ ...m, pin: e.target.value.replace(/\D/g, "").slice(0, 5) }))} />
+              <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>4–5 digit mobile money PIN.</div>
+            </div>
+            <button style={{ ...S.btnPrimary, opacity: mobileValid() ? 1 : 0.4 }}
+              disabled={!mobileValid()} onClick={() => setStep("amount")}>
+              Continue →
+            </button>
+          </div>
+        )}
+
+        {/* Step: card details */}
+        {step === "card" && (
+          <div style={S.card}>
+            <button onClick={() => setStep("method")} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", fontSize: 13, marginBottom: 14, padding: 0 }}>← Back</button>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>Card / Bank details</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, marginBottom: 18 }}>Simulated — no real card will be credited.</div>
+            <div style={{ marginBottom: 14 }}>
+              <label style={S.label}>Card Number</label>
+              <input style={{ ...S.input, borderColor: card.number && !luhnOk(card.number.replace(/\s/g, "")) ? COLORS.danger : COLORS.cardBorder }}
+                inputMode="numeric" placeholder="4242 4242 4242 4242" value={card.number}
+                onChange={e => setCard(c => ({ ...c, number: formatCardNumber(e.target.value) }))} />
+              {card.number && card.number.replace(/\s/g, "").length >= 13 && !luhnOk(card.number.replace(/\s/g, "")) && (
+                <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>That card number doesn't look right.</div>
+              )}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+              <div>
+                <label style={S.label}>Expiry</label>
+                <input style={{ ...S.input, borderColor: card.expiry.length === 5 && !expiryOk(card.expiry) ? COLORS.danger : COLORS.cardBorder }}
+                  placeholder="MM/YY" inputMode="numeric" maxLength={5} value={card.expiry}
+                  onChange={e => setCard(c => ({ ...c, expiry: formatExpiry(e.target.value) }))} />
+                {card.expiry.length === 5 && !expiryOk(card.expiry) && (
+                  <div style={{ fontSize: 11, color: COLORS.danger, marginTop: 4 }}>Expired or invalid.</div>
+                )}
+              </div>
+              <div>
+                <label style={S.label}>CVV</label>
+                <input style={S.input} type="password" inputMode="numeric" maxLength={4} placeholder="123" value={card.cvv}
+                  onChange={e => setCard(c => ({ ...c, cvv: e.target.value.replace(/\D/g, "").slice(0, 4) }))} />
+              </div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={S.label}>Cardholder Name</label>
+              <input style={S.input} placeholder="As shown on card" value={card.name} maxLength={64}
+                onChange={e => setCard(c => ({ ...c, name: e.target.value }))} />
+            </div>
+            <button style={{ ...S.btnPrimary, opacity: cardValid() ? 1 : 0.4 }}
+              disabled={!cardValid()} onClick={() => setStep("amount")}>
+              Continue →
+            </button>
+          </div>
+        )}
+
+        {/* Step: amount + confirm */}
+        {step === "amount" && (
+          <div style={S.card}>
+            <button onClick={() => setStep(method === "card" ? "card" : "mobile")} style={{ background: "none", border: "none", color: COLORS.textMuted, cursor: "pointer", fontSize: 13, marginBottom: 14, padding: 0 }}>← Back</button>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>Enter amount</div>
+            <div style={{ fontSize: 12, color: COLORS.textMuted, marginBottom: 18 }}>Withdrawing via <span style={{ color: COLORS.text, fontWeight: 700 }}>{methodLabel}</span></div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={S.label}>Amount ({currency})</label>
+              <input style={{ ...S.input, fontSize: 22, fontWeight: 700, borderColor: insufficient ? COLORS.danger : COLORS.cardBorder }}
+                type="number" placeholder="0.00" value={amount}
+                onChange={e => setAmount(e.target.value)} autoFocus />
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12, color: COLORS.textMuted }}>
+                <span>Available: {formatAmount(balance, currency)}</span>
+                {insufficient && <span style={{ color: COLORS.danger }}>Insufficient balance</span>}
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {[50, 100, 500, 1000].map(v => (
+                  <button key={v} onClick={() => setAmount(String(v))}
+                    style={{ padding: "6px 14px", borderRadius: 99, border: `1px solid ${COLORS.cardBorder}`, background: COLORS.inputBg, color: COLORS.textSub, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                    {v}
+                  </button>
+                ))}
+                <button onClick={() => setAmount(String(balance))}
+                  style={{ padding: "6px 14px", borderRadius: 99, border: `1px solid ${COLORS.cardBorder}`, background: COLORS.inputBg, color: COLORS.accent, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                  Max
+                </button>
+              </div>
+            </div>
+            <div style={{ background: COLORS.inputBg, borderRadius: 10, padding: "12px 14px", marginBottom: 20, fontSize: 13 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ color: COLORS.textMuted }}>Method</span>
+                <span style={{ fontWeight: 700 }}>{methodLabel}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ color: COLORS.textMuted }}>Current balance</span>
+                <span style={{ fontWeight: 700 }}>{formatAmount(balance, currency)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 8, borderTop: `1px solid ${COLORS.cardBorder}` }}>
+                <span style={{ color: COLORS.textMuted }}>New balance</span>
+                <span style={{ fontWeight: 700, color: insufficient ? COLORS.danger : COLORS.success }}>{formatAmount(Math.max(0, Number(balance) - parsedAmount), currency)}</span>
+              </div>
+            </div>
+            <button style={{ ...S.btnPrimary, opacity: (loading || parsedAmount <= 0 || insufficient) ? 0.6 : 1 }}
+              disabled={loading || parsedAmount <= 0 || insufficient} onClick={submitWithdraw}>
+              {loading ? "Processing…" : `Withdraw ${amount ? formatAmount(parsedAmount, currency) : ""}`}
+            </button>
+          </div>
+        )}
+
+        {/* Step: success */}
+        {step === "success" && (
+          <div style={{ ...S.card, textAlign: "center", padding: 40 }}>
+            <div style={{ width: 72, height: 72, borderRadius: 99, background: COLORS.success + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, margin: "0 auto 20px", color: COLORS.success }}>✓</div>
+            <h2 style={{ fontSize: 22, fontWeight: 900, color: COLORS.success, fontFamily: "'Syne', sans-serif", marginBottom: 8 }}>Withdrawal Successful</h2>
+            <p style={{ color: COLORS.textMuted, fontSize: 14, marginBottom: 20 }}>
+              {formatAmount(withdrawnAmount, currency)} sent to {methodLabel}.
+            </p>
+            <div style={{ background: COLORS.inputBg, borderRadius: 10, padding: "12px 14px", marginBottom: 20, fontSize: 13, textAlign: "left" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: COLORS.textMuted }}>New balance</span>
+                <span style={{ fontWeight: 700, color: COLORS.success }}>{formatAmount(user?.balance || 0, currency)}</span>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button style={S.btnSecondary} onClick={() => setPage("dashboard")}>Back to Dashboard</button>
+              <button style={S.btnPrimary} onClick={reset}>Withdraw Again</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── SETTINGS PAGE ────────────────────────────────────────────────────────────
 
 function SettingsPage({ user, setUser, showToast, setPage, RATES }) {
@@ -2230,7 +2556,7 @@ export default function App() {
     // Only remember auth-gated pages across reloads. Pre-login pages (home,
     // login, register) should never be "sticky" — a fresh visit always lands
     // on the homepage.
-    const stickyPages = new Set(["dashboard", "wallet", "send", "deposit", "history", "notifications", "settings", "support"]);
+    const stickyPages = new Set(["dashboard", "wallet", "send", "deposit", "withdraw", "history", "notifications", "settings", "support"]);
     try {
       if (stickyPages.has(p)) localStorage.setItem("ozeb-page", p);
       else localStorage.removeItem("ozeb-page");
@@ -2279,7 +2605,7 @@ export default function App() {
         username: profile?.username || "",
       });
       // Logged in: keep the stored auth-gated page if any, else dashboard.
-      const authPages = new Set(["dashboard", "wallet", "send", "deposit", "history", "notifications", "settings", "support"]);
+      const authPages = new Set(["dashboard", "wallet", "send", "deposit", "withdraw", "history", "notifications", "settings", "support"]);
       setPageRaw(prev => authPages.has(prev) ? prev : "dashboard");
       setAuthChecked(true);
     };
@@ -2335,7 +2661,7 @@ export default function App() {
     </div>
   );
 
-  const authPages = new Set(["dashboard", "wallet", "send", "deposit", "history", "notifications", "settings", "support"]);
+  const authPages = new Set(["dashboard", "wallet", "send", "deposit", "withdraw", "history", "notifications", "settings", "support"]);
   const currentPage = authPages.has(page) && !user ? "login" : page;
 
   if (currentPage === "home") return (
@@ -2358,6 +2684,7 @@ export default function App() {
         {currentPage === "wallet"        && <WalletPage user={user} setUser={setUser} RATES={RATES} />}
         {currentPage === "send"          && <SendPage user={user} setUser={setUser} showToast={showToast} setPage={setPage} RATES={RATES} />}
         {currentPage === "deposit"       && <DepositPage user={user} setUser={setUser} showToast={showToast} setPage={setPage} />}
+        {currentPage === "withdraw"      && <WithdrawPage user={user} setUser={setUser} showToast={showToast} setPage={setPage} />}
         {currentPage === "history"       && <HistoryPage user={user} />}
         {currentPage === "notifications" && <NotificationsPage user={user} />}
         {currentPage === "settings"      && <SettingsPage user={user} setUser={setUser} showToast={showToast} setPage={setPage} RATES={RATES} theme={theme} toggleTheme={toggleTheme} />}
