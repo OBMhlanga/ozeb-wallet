@@ -161,16 +161,53 @@ function Toast({ toast, onClose }) {
 
 // ─── TRANSACTION ROW ──────────────────────────────────────────────────────────
 
+// Classify a raw transactions row into a UI-friendly shape. Deposits and
+// withdrawals are encoded as self→self rows with a "[DEPOSIT]" / "[WITHDRAW]"
+// marker in the note (the live schema requires NOT NULL sender/receiver).
+function classifyTx(tx, userId) {
+  const note = tx.note || "";
+  const isDeposit = note.startsWith("[DEPOSIT]");
+  const isWithdraw = note.startsWith("[WITHDRAW]");
+  const isSelf = tx.sender_id === tx.receiver_id;
+  let type;
+  if (isDeposit && isSelf) type = "deposit";
+  else if (isWithdraw && isSelf) type = "withdrawal";
+  else if (tx.sender_id === userId) type = "sent";
+  else type = "received";
+  const counterparty =
+    type === "deposit" || type === "withdrawal"
+      ? note.replace(/^\[(DEPOSIT|WITHDRAW)\]\s*/, "") || "—"
+      : type === "sent"
+      ? tx.receiver?.username
+      : tx.sender?.username;
+  const isOutflow = type === "sent" || type === "withdrawal";
+  return {
+    id: tx.id,
+    type,
+    isOutflow,
+    counterparty,
+    amount: isOutflow ? tx.sent_amount : tx.received_amount,
+    currency: isOutflow ? tx.sent_currency : tx.received_currency,
+    status: tx.status,
+    date: tx.created_at?.split("T")[0],
+    created_at: tx.created_at,
+    note: tx.note || "—",
+  };
+}
+
+const TYPE_LABELS = { sent: "sent", received: "received", deposit: "deposit", withdrawal: "withdrawal" };
+
 function TransactionRow({ tx }) {
-  const isSent = tx.type === "sent";
+  const isOutflow = tx.isOutflow ?? (tx.type === "sent" || tx.type === "withdrawal");
   const statusColors = { completed: COLORS.success, pending: COLORS.warning, failed: COLORS.danger };
   const statusColor = statusColors[tx.status] || COLORS.textMuted;
+  const badgeColor = isOutflow ? COLORS.danger : COLORS.success;
   return (
     <div style={{ display: "grid", gridTemplateColumns: "120px 90px 140px 120px 1fr 100px", gap: 8, padding: "12px 16px", borderBottom: `1px solid ${COLORS.cardBorder}`, alignItems: "center" }}>
       <div style={{ fontSize: 13, color: COLORS.textMuted }}>{tx.date}</div>
-      <div><span style={{ ...S.badge(isSent ? COLORS.danger : COLORS.success) }}>{tx.type}</span></div>
+      <div><span style={{ ...S.badge(badgeColor) }}>{TYPE_LABELS[tx.type] || tx.type}</span></div>
       <div style={{ fontSize: 13, fontWeight: 600 }}>{tx.counterparty || "—"}</div>
-      <div style={{ fontSize: 13, fontWeight: 700, color: isSent ? COLORS.danger : COLORS.success }}>{isSent ? "-" : "+"}{formatAmount(tx.amount, tx.currency)}</div>
+      <div style={{ fontSize: 13, fontWeight: 700, color: isOutflow ? COLORS.danger : COLORS.success }}>{isOutflow ? "-" : "+"}{formatAmount(tx.amount, tx.currency)}</div>
       <div style={{ fontSize: 12, color: COLORS.textMuted }}>{tx.note || "—"}</div>
       <div><span style={{ ...S.badge(statusColor) }}>{tx.status}</span></div>
     </div>
@@ -1040,11 +1077,12 @@ function DashboardPage({ user, setPage, setUser, RATES }) {
         .order("created_at", { ascending: true });
 
       if (txData) {
+        const classified = txData.map(tx => classifyTx(tx, user.id));
+
         // Build real running balance chart
         let running = 0;
-        const points = txData.map(tx => {
-          const isSent = tx.sender_id === user.id;
-          running += isSent ? -Number(tx.sent_amount) : Number(tx.received_amount);
+        const points = classified.map(tx => {
+          running += tx.isOutflow ? -Number(tx.amount || 0) : Number(tx.amount || 0);
           return {
             d: new Date(tx.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
             v: parseFloat(running.toFixed(4)),
@@ -1053,28 +1091,19 @@ function DashboardPage({ user, setPage, setUser, RATES }) {
         if (walletData) points.push({ d: "Now", v: parseFloat(Number(walletData.balance).toFixed(4)) });
         setChartData(points.length < 2 ? [{ d: "Start", v: 0 }, { d: "Now", v: walletData?.balance || 0 }] : points);
 
-        // Recent 4 transactions
-        setTransactions(txData.slice(-4).reverse().map(tx => ({
-          id: tx.id,
-          type: tx.sender_id === user.id ? "sent" : "received",
-          counterparty: tx.sender_id === user.id ? tx.receiver?.username : tx.sender?.username,
-          amount: tx.sender_id === user.id ? tx.sent_amount : tx.received_amount,
-          currency: tx.sender_id === user.id ? tx.sent_currency : tx.received_currency,
-          status: tx.status,
-          date: tx.created_at?.split("T")[0],
-          note: tx.note || "",
-        })));
+        // Recent 4 transactions (most recent first)
+        setTransactions(classified.slice(-4).reverse());
 
-        // 30-day stats
+        // 30-day stats: outflow vs inflow (counts deposits and withdrawals too)
         const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-        const recent = txData.filter(t => t.created_at >= thirtyDaysAgo);
-        const sent = recent.filter(t => t.sender_id === user.id);
-        const recv = recent.filter(t => t.receiver_id === user.id);
+        const recent = classified.filter(t => t.created_at >= thirtyDaysAgo);
+        const out = recent.filter(t => t.isOutflow);
+        const inn = recent.filter(t => !t.isOutflow);
         setStats({
-          sent: sent.reduce((s, t) => s + Number(t.sent_amount), 0),
-          sentCount: sent.length,
-          received: recv.reduce((s, t) => s + Number(t.received_amount), 0),
-          receivedCount: recv.length,
+          sent: out.reduce((s, t) => s + Number(t.amount || 0), 0),
+          sentCount: out.length,
+          received: inn.reduce((s, t) => s + Number(t.amount || 0), 0),
+          receivedCount: inn.length,
         });
       }
       setLoading(false);
@@ -1189,7 +1218,7 @@ function WalletPage({ user, setUser, RATES }) {
       const [{ data: walletData }, { data: txData }] = await Promise.all([
         supabase.from("wallets").select("*").eq("user_id", user.id).single(),
         supabase.from("transactions")
-          .select("created_at, sender_id, receiver_id, sent_amount, received_amount")
+          .select("created_at, sender_id, receiver_id, sent_amount, received_amount, sent_currency, received_currency, status, note")
           .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
           .order("created_at", { ascending: true }),
       ]);
@@ -1197,13 +1226,12 @@ function WalletPage({ user, setUser, RATES }) {
         setWallet(walletData);
         setUser(prev => ({ ...prev, balance: walletData.balance, currency: walletData.currency }));
       }
-      // Build the running-balance chart from real transactions. Money in
-      // (received OR deposit where sender_id is null) increases the running
-      // total; money out (sent OR withdrawal) decreases it.
+      // Running-balance chart. classifyTx handles deposits (self-self with
+      // [DEPOSIT] note → inflow) and withdrawals ([WITHDRAW] → outflow).
       let running = 0;
-      const points = (txData || []).map(tx => {
-        const isOutflow = tx.sender_id === user.id;
-        running += isOutflow ? -Number(tx.sent_amount || 0) : Number(tx.received_amount || 0);
+      const points = (txData || []).map(raw => {
+        const tx = classifyTx(raw, user.id);
+        running += tx.isOutflow ? -Number(tx.amount || 0) : Number(tx.amount || 0);
         return {
           d: new Date(tx.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
           v: parseFloat(running.toFixed(4)),
@@ -1483,17 +1511,6 @@ function HistoryPage({ user }) {
   const [filter, setFilter] = useState("all");
   const [loading, setLoading] = useState(true);
 
-  const mapTx = (data, userId) => data.map(tx => ({
-    id: tx.id,
-    type: tx.sender_id === userId ? "sent" : "received",
-    counterparty: tx.sender_id === userId ? tx.receiver?.username : tx.sender?.username,
-    amount: tx.sender_id === userId ? tx.sent_amount : tx.received_amount,
-    currency: tx.sender_id === userId ? tx.sent_currency : tx.received_currency,
-    status: tx.status,
-    date: tx.created_at?.split("T")[0],
-    note: tx.note || "—",
-  }));
-
   useEffect(() => {
     if (!user?.id) return;
     const loadTransactions = async () => {
@@ -1502,7 +1519,7 @@ function HistoryPage({ user }) {
         .select(`*, sender:profiles!sender_id(username), receiver:profiles!receiver_id(username)`)
         .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
         .order("created_at", { ascending: false });
-      if (data) setTransactions(mapTx(data, user.id));
+      if (data) setTransactions(data.map(tx => classifyTx(tx, user.id)));
       setLoading(false);
     };
     loadTransactions();
@@ -1520,7 +1537,7 @@ function HistoryPage({ user }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 28 }}>
         <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0, fontFamily: "'Syne', sans-serif" }}>Transaction History</h1>
         <div style={{ display: "flex", gap: 8 }}>
-          {["all", "sent", "received"].map(f => (
+          {["all", "sent", "received", "deposit", "withdrawal"].map(f => (
             <button key={f} onClick={() => setFilter(f)} style={{ padding: "6px 16px", borderRadius: 8, border: `1px solid ${filter === f ? COLORS.accent : COLORS.cardBorder}`, background: filter === f ? COLORS.accent : "transparent", color: filter === f ? "#000" : COLORS.textMuted, fontSize: 13, cursor: "pointer", fontWeight: filter === f ? 700 : 400, textTransform: "capitalize", transition: "all 0.15s" }}>
               {f.charAt(0).toUpperCase() + f.slice(1)}
             </button>
@@ -1726,34 +1743,29 @@ function DepositPage({ user, setUser, showToast, setPage }) {
         .eq("user_id", user.id);
       if (walletErr) throw new Error(walletErr.message);
 
-      // Best-effort transaction record + notification. If the schema doesn't
-      // accept a deposit row (e.g. NOT NULL on sender_id), we still keep the
-      // balance update so the demo flow works.
+      // Schema requires NOT NULL sender_id/receiver_id and has no `type` column,
+      // so we encode deposits as a self→self row tagged in the note. The
+      // History/Dashboard mappers detect the [DEPOSIT] marker.
       const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
       const { error: txErr } = await supabase.from("transactions").insert({
-        sender_id: null,
+        sender_id: user.id,
         receiver_id: user.id,
         sent_amount: amt,
         received_amount: amt,
         sent_currency: currency,
         received_currency: currency,
         status: "completed",
-        type: "deposit",
-        note: `Deposit via ${methodLabel}`,
+        note: `[DEPOSIT] via ${methodLabel}`,
       });
       if (txErr) console.warn("Deposit transaction insert failed:", txErr.message);
-      // Try with the new type first, fall back to "system" if the schema rejects it.
-      const notif = {
+      const { error: nErr } = await supabase.from("notifications").insert({
         user_id: user.id,
         title: "Deposit successful",
         message: `${formatAmount(amt, currency)} added via ${methodLabel}.`,
         is_read: false,
-      };
-      const { error: nErr } = await supabase.from("notifications").insert({ ...notif, type: "deposit" });
-      if (nErr) {
-        console.warn("Notification insert with type=deposit failed, retrying as system:", nErr.message);
-        await supabase.from("notifications").insert({ ...notif, type: "system" });
-      }
+        type: "transfer",
+      });
+      if (nErr) console.warn("Deposit notification insert failed:", nErr.message);
 
       setUser(prev => ({ ...prev, balance: newBalance }));
       setDepositedAmount(amt);
@@ -2051,33 +2063,27 @@ function WithdrawPage({ user, setUser, showToast, setPage }) {
       if (walletErr) throw new Error(walletErr.message);
 
       const methodLabel = method === "myzaka" ? "MyZaka" : method === "orange" ? "Orange Money" : "Card";
-      // Record the withdrawal so it appears in History. sender_id = user, receiver_id = null.
-      const txRow = {
+      // Schema requires NOT NULL sender_id/receiver_id, so we encode withdrawals
+      // as a self→self row tagged with the [WITHDRAW] marker in the note.
+      const { error: txErr } = await supabase.from("transactions").insert({
         sender_id: user.id,
-        receiver_id: null,
+        receiver_id: user.id,
         sent_amount: amt,
         received_amount: amt,
         sent_currency: currency,
         received_currency: currency,
         status: "completed",
-        note: `Withdrawal via ${methodLabel}`,
-      };
-      const { error: txErr } = await supabase.from("transactions").insert({ ...txRow, type: "withdrawal" });
-      if (txErr) {
-        console.warn("Transaction insert with type=withdrawal failed, retrying as 'sent':", txErr.message);
-        await supabase.from("transactions").insert({ ...txRow, type: "sent" });
-      }
-      const notif = {
+        note: `[WITHDRAW] via ${methodLabel}`,
+      });
+      if (txErr) console.warn("Withdrawal transaction insert failed:", txErr.message);
+      const { error: nErr } = await supabase.from("notifications").insert({
         user_id: user.id,
         title: "Withdrawal successful",
         message: `${formatAmount(amt, currency)} sent to ${methodLabel}.`,
         is_read: false,
-      };
-      const { error: nErr } = await supabase.from("notifications").insert({ ...notif, type: "withdrawal" });
-      if (nErr) {
-        console.warn("Notification insert with type=withdrawal failed, retrying as system:", nErr.message);
-        await supabase.from("notifications").insert({ ...notif, type: "system" });
-      }
+        type: "transfer",
+      });
+      if (nErr) console.warn("Withdrawal notification insert failed:", nErr.message);
 
       setUser(prev => ({ ...prev, balance: newBalance }));
       setWithdrawnAmount(amt);
